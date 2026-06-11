@@ -1,0 +1,7 @@
+{
+  "name": "Game: Drova - Forsaken Kin",
+  "author": "TrustNoOneElse",
+  "version": "1.1.0",
+  "description": "Adds support for Drova - Forsaken Kin (MelonLoader-based modding).",
+  "type": "game"
+}
