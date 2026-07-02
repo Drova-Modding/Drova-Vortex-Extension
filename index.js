@@ -2,6 +2,7 @@
 const path = require('path');
 const os = require('os');
 const https = require('https');
+const crypto = require('crypto');
 const nodeFs = require('fs');
 let winapi;
 try { winapi = require('winapi-bindings'); } catch (e) { winapi = null; }
@@ -20,8 +21,9 @@ const MODS_DIR = 'Mods';
 const TRANSLATIONS_DIR = path.join('Drova_Data', 'StreamingAssets', 'Localization');
 
 // Latest MelonLoader x64 release zip (LavaGang/MelonLoader)
+const MELON_ASSET_NAME = 'MelonLoader.x64.zip';
 const MELON_DOWNLOAD_URL =
-  'https://github.com/LavaGang/MelonLoader/releases/latest/download/MelonLoader.x64.zip';
+  'https://github.com/LavaGang/MelonLoader/releases/latest/download/' + MELON_ASSET_NAME;
 const MELON_LATEST_API =
   'https://api.github.com/repos/LavaGang/MelonLoader/releases/latest';
 const ML_VERSION_MARKER = path.join(ML_DIR, '.vortex-installed-version');
@@ -66,13 +68,21 @@ function modsRelPath() {
 // ---------------------------------------------------------------------------
 
 async function isMelonLoaderInstalled(gamePath) {
+  // Only count it as installed if the files are really there: version.dll plus
+  // a non-empty MelonLoader/ folder. An empty folder left over from a failed
+  // extract shouldn't block a fresh reinstall.
   try {
-    await fs.statAsync(path.join(gamePath, ML_PROXY_DLL));
-    return true;
-  } catch (e) { /* not found */ }
+    const st = await fs.statAsync(path.join(gamePath, ML_PROXY_DLL));
+    if (!st.isFile() || st.size === 0) return false;
+  } catch (e) {
+    return false;
+  }
   try {
-    const st = await fs.statAsync(path.join(gamePath, ML_DIR));
-    return st.isDirectory();
+    const dir = path.join(gamePath, ML_DIR);
+    const st = await fs.statAsync(dir);
+    if (!st.isDirectory()) return false;
+    const entries = await fs.readdirAsync(dir);
+    return Array.isArray(entries) && entries.length > 0;
   } catch (e) {
     return false;
   }
@@ -123,17 +133,42 @@ function fetchText(url, redirectsLeft = 5) {
   });
 }
 
-async function getLatestMelonTag() {
+// Grabs the latest release info. sha256 comes from GitHub's asset digest when
+// it's there; any field can be null if we're offline or it isn't published.
+async function getLatestMelonRelease() {
   try {
     const body = await fetchText(MELON_LATEST_API);
     const data = JSON.parse(body);
-    if (data && typeof data.tag_name === 'string') {
-      return data.tag_name;
+    const tag = (data && typeof data.tag_name === 'string') ? data.tag_name : null;
+    let downloadUrl = null;
+    let sha256 = null;
+    if (data && Array.isArray(data.assets)) {
+      const asset = data.assets.find(a => a && a.name === MELON_ASSET_NAME);
+      if (asset) {
+        if (typeof asset.browser_download_url === 'string') {
+          downloadUrl = asset.browser_download_url;
+        }
+        if (typeof asset.digest === 'string') {
+          const m = /^sha256:([0-9a-f]{64})$/i.exec(asset.digest.trim());
+          if (m) sha256 = m[1].toLowerCase();
+        }
+      }
     }
+    return { tag, downloadUrl, sha256 };
   } catch (err) {
-    log('warn', '[drova] getLatestMelonTag failed', { err: err && err.message });
+    log('warn', '[drova] getLatestMelonRelease failed', { err: err && err.message });
+    return { tag: null, downloadUrl: null, sha256: null };
   }
-  return null;
+}
+
+function sha256File(filePath) {
+  return new Promise((resolve, reject) => {
+    const hash = crypto.createHash('sha256');
+    const stream = nodeFs.createReadStream(filePath);
+    stream.on('error', reject);
+    stream.on('data', chunk => hash.update(chunk));
+    stream.on('end', () => resolve(hash.digest('hex')));
+  });
 }
 
 async function getInstalledMelonVersion(gamePath) {
@@ -201,6 +236,8 @@ function downloadToFile(url, destPath, redirectsLeft = 5) {
 async function installMelonLoader(api, gamePath, opts = {}) {
   const isUpdate = !!opts.isUpdate;
   const latestTag = opts.latestTag || null;
+  const downloadUrl = opts.downloadUrl || MELON_DOWNLOAD_URL;
+  const expectedSha = opts.sha256 || null;
   const tmpDir = path.join(os.tmpdir(), 'vortex-drova-melonloader');
   try {
     await fs.ensureDirWritableAsync(tmpDir);
@@ -216,11 +253,39 @@ async function installMelonLoader(api, gamePath, opts = {}) {
   });
 
   try {
-    await downloadToFile(MELON_DOWNLOAD_URL, zipPath);
+    await downloadToFile(downloadUrl, zipPath);
   } catch (err) {
     api.dismissNotification('drova-melon-installing');
     api.showErrorNotification('Failed to download MelonLoader', err, { allowReport: false });
     return false;
+  }
+
+  // Check the download against the published checksum if we have one. A
+  // mismatch means a bad or tampered file, so don't extract it.
+  if (expectedSha) {
+    let actualSha;
+    try {
+      actualSha = await sha256File(zipPath);
+    } catch (err) {
+      try { await fs.removeAsync(zipPath); } catch (e) { /* ignore */ }
+      api.dismissNotification('drova-melon-installing');
+      api.showErrorNotification('Failed to verify MelonLoader download', err, { allowReport: false });
+      return false;
+    }
+    if (actualSha.toLowerCase() !== expectedSha) {
+      try { await fs.removeAsync(zipPath); } catch (e) { /* ignore */ }
+      log('error', '[drova] MelonLoader hash mismatch', { expectedSha, actualSha });
+      api.dismissNotification('drova-melon-installing');
+      api.showErrorNotification(
+        'MelonLoader verification failed',
+        new Error('Downloaded archive did not match the published SHA-256 checksum. '
+          + 'The download may be corrupted or tampered with; installation was aborted.'),
+        { allowReport: false });
+      return false;
+    }
+    log('info', '[drova] MelonLoader hash verified', { sha256: actualSha });
+  } else {
+    log('warn', '[drova] no published SHA-256 for MelonLoader asset; skipping hash verification');
   }
 
   try {
@@ -334,7 +399,8 @@ async function ensureMelonLoader(api) {
     if (!discovery || !discovery.path) return;
 
     const gamePath = discovery.path;
-    const latestTag = await getLatestMelonTag();
+    const release = await getLatestMelonRelease();
+    const latestTag = release.tag;
 
     if (await isMelonLoaderInstalled(gamePath)) {
       const installedTag = await getInstalledMelonVersion(gamePath);
@@ -363,7 +429,12 @@ async function ensureMelonLoader(api) {
         { label: 'Update' },
       ]);
       if (result.action === 'Update') {
-        await installMelonLoader(api, gamePath, { isUpdate: true, latestTag });
+        await installMelonLoader(api, gamePath, {
+          isUpdate: true,
+          latestTag,
+          downloadUrl: release.downloadUrl,
+          sha256: release.sha256,
+        });
       }
       return;
     }
@@ -382,7 +453,12 @@ async function ensureMelonLoader(api) {
     ]);
 
     if (result.action === 'Install') {
-      const ok = await installMelonLoader(api, gamePath, { isUpdate: false, latestTag });
+      const ok = await installMelonLoader(api, gamePath, {
+        isUpdate: false,
+        latestTag,
+        downloadUrl: release.downloadUrl,
+        sha256: release.sha256,
+      });
       if (ok) await ensureDotNet6(api);
     }
   } catch (err) {
@@ -494,7 +570,7 @@ function main(context) {
     queryPath: findGame,
     supportedTools: [],
     queryModPath: modsRelPath,
-    logo: 'gameart.jpg',
+    logo: 'gameart.jpeg',
     executable: () => GAME_EXE,
     requiredFiles: [GAME_EXE],
     setup: () => ensureMelonLoader(context.api),
