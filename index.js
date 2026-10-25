@@ -517,8 +517,11 @@ function testTranslation(files, gameId) {
   if (gameId !== GAME_ID) return Promise.resolve({ supported: false, requiredFiles: [] });
   const lower = files.map(f => f.toLowerCase());
   const hasLoc = lower.some(f => f.endsWith('.loc'));
-  log('info', '[drova] testTranslation', { gameId, sampleFiles: files.slice(0, 5), hasLoc });
-  return Promise.resolve({ supported: hasLoc, requiredFiles: [] });
+  // Mods that ship their own .loc files next to a DLL are not translations;
+  // installTranslation keeps only the .loc files and would drop the DLL.
+  const hasDll = lower.some(f => f.endsWith('.dll'));
+  log('info', '[drova] testTranslation', { gameId, sampleFiles: files.slice(0, 5), hasLoc, hasDll });
+  return Promise.resolve({ supported: hasLoc && !hasDll, requiredFiles: [] });
 }
 
 function installTranslation(files) {
@@ -583,8 +586,10 @@ function main(context) {
   });
 
   // Lower priority number wins. All well below Vortex's BasicInstaller (~1000).
-  context.registerInstaller('drova-translation', 15, testTranslation, installTranslation);
-  context.registerInstaller('drova-melon-pack', 20, testMelonPack, installMelonPack);
+  // Melon pack goes first: an archive already laid out as Mods/, UserLibs/ etc.
+  // installs as-is, even when it carries .loc files under Mods/<mod>/Localization.
+  context.registerInstaller('drova-melon-pack', 15, testMelonPack, installMelonPack);
+  context.registerInstaller('drova-translation', 20, testTranslation, installTranslation);
   context.registerInstaller('drova-simple-dll', 25, testSimpleDll, installSimpleDll);
 
   context.once(() => {
